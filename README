@@ -1,0 +1,13 @@
+This is a mirror of http://www.vim.org/scripts/script.php?script_id=4978
+
+There's a REPL in fireplace, but you probably wouldn't have noticed if I hadn't told you.  Such is the way with fireplace.vim.  By the way, this plugin is for Clojure.
+
+Partial feature list:
+
+* Transparent setup and automatic connection.
+* Evaluate code from the buffer or arbitrary input.
+* Jump to namespace or function definitions.
+* Wrappers for source, doc, and macroexpand.
+* Omnicomplete.
+
+See http://clojure-doc.org/articles/tutorials/vim_fireplace.html for help getting started.
