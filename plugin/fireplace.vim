@@ -1,6 +1,7 @@
 " fireplace.vim - Clojure REPL support
 " Maintainer:   Tim Pope <http://tpo.pe/>
-" Version:      1.0
+" Version:      1.1
+" GetLatestVimScripts: 4978 1 :AutoInstall: fireplace.vim
 
 if exists("g:loaded_fireplace") || v:version < 700 || &cp
   finish
@@ -40,6 +41,8 @@ function! fireplace#jar_contents(path) abort
   if !exists('s:zipinfo')
     if executable('zipinfo')
       let s:zipinfo = 'zipinfo -1 '
+    elseif executable('jar')
+      let s:zipinfo = 'jar tf '
     elseif executable('python')
       let s:zipinfo = 'python -c '.shellescape('import zipfile, sys; print chr(10).join(zipfile.ZipFile(sys.argv[1]).namelist())').' '
     else
@@ -80,6 +83,64 @@ function! fireplace#ns_complete(A, L, P) abort
   return filter(map(matches, 's:to_ns(v:val)'), 'a:A ==# "" || a:A ==# v:val[0 : strlen(a:A)-1]')
 endfunction
 
+let s:short_types = {
+      \ 'function': 'f',
+      \ 'macro': 'm',
+      \ 'var': 'v',
+      \ 'special-form': 's',
+      \ 'class': 'c',
+      \ 'keyword': 'k',
+      \ 'local': 'l',
+      \ 'namespace': 'n',
+      \ 'field': 'i',
+      \ 'method': 'f',
+      \ 'static-field': 'i',
+      \ 'static-method': 'f',
+      \ 'resource': 'r'
+      \ }
+
+function! s:candidate(val) abort
+  let type = get(a:val, 'type', '')
+  let arglists = get(a:val, 'arglists', [])
+  return {
+        \ 'word': get(a:val, 'candidate'),
+        \ 'kind': get(s:short_types, type, type),
+        \ 'info': get(a:val, 'doc', ''),
+        \ 'menu': empty(arglists) ? '' : '(' . join(arglists, ' ') . ')'
+        \ }
+endfunction
+
+function! s:get_complete_context() abort
+  " Find toplevel form
+  " If cursor is on start parenthesis we don't want to find the form
+  " If cursor is on end parenthesis we want to find the form
+  let [line1, col1] = searchpairpos('(', '', ')', 'Wrnb', g:fireplace#skip)
+  let [line2, col2] = searchpairpos('(', '', ')', 'Wrnc', g:fireplace#skip)
+
+  if (line1 == 0 && col1 == 0) || (line2 == 0 && col2 == 0)
+    return ""
+  endif
+
+  if line1 == line2
+    let expr = getline(line1)[col1-1 : col2-1]
+  else
+    let expr = getline(line1)[col1-1 : -1] . ' '
+          \ . join(getline(line1+1, line2-1), ' ')
+          \ . getline(line2)[0 : col2-1]
+  endif
+
+  " Calculate the position of cursor inside the expr
+  if line1 == line('.')
+    let p = col('.') - col1
+  else
+    let p = strlen(getline(line1)[col1-1 : -1])
+          \ + strlen(join(getline(line1 + 1, line('.') - 1), ' '))
+          \ + col('.')
+  endif
+
+  return strpart(expr, 0, p) . '__prefix__' . strpart(expr, p)
+endfunction
+
 function! fireplace#omnicomplete(findstart, base) abort
   if a:findstart
     let line = getline('.')[0 : col('.')-2]
@@ -88,12 +149,21 @@ function! fireplace#omnicomplete(findstart, base) abort
     try
 
       if fireplace#op_available('complete')
-        let response = fireplace#message({'op': 'complete', 'symbol': a:base})
-        if type(get(response[0], 'value')) == type([])
-          if type(get(response[0].value, 0)) == type([])
-            return map(response[0].value[0], '{"word": v:val}')
-          elseif type(get(response[0].value, 0)) == type('')
-            return map(response[0].value, '{"word": v:val}')
+        let response = fireplace#message({
+              \ 'op': 'complete',
+              \ 'symbol': a:base,
+              \ 'extra-metadata': ['arglists', 'doc'],
+              \ 'context': s:get_complete_context()
+              \ })
+        let trans = '{"word": (v:val =~# ''[./]'' ? "" : matchstr(a:base, ''^.\+/'')) . v:val}'
+        let value = get(response[0], 'value', get(response[0], 'completions'))
+        if type(value) == type([])
+          if type(get(value, 0)) == type({})
+            return map(value, 's:candidate(v:val)')
+          elseif type(get(value, 0)) == type([])
+            return map(value[0], trans)
+          elseif type(get(value, 0)) == type('')
+            return map(value, trans)
           else
             return []
           endif
@@ -149,10 +219,6 @@ if !exists('s:repls')
   let s:repl_portfiles = {}
 endif
 
-function! s:repl.user_ns() abort
-  return 'user'
-endfunction
-
 function! s:repl.path() dict abort
   return self.connection.path()
 endfunction
@@ -164,16 +230,6 @@ function! s:conn_try(connection, function, ...) abort
     call s:unregister_connection(a:connection)
     throw v:exception
   endtry
-endfunction
-
-function! s:repl.eval(expr, options) dict abort
-  if has_key(a:options, 'ns') && a:options.ns !=# self.user_ns()
-    let error = self.preload(a:options.ns)
-    if !empty(error)
-      return error
-    endif
-  endif
-  return s:conn_try(self.connection, 'eval', a:expr, a:options)
 endfunction
 
 function! s:repl.message(payload, ...) dict abort
@@ -225,9 +281,9 @@ function! s:repl.piggieback(arg, ...) abort
   elseif a:arg =~# '^\d\{1,5}$'
     call connection.eval("(require 'cljs.repl.browser)")
     let port = matchstr(a:arg, '^\d\{1,5}$')
-    let arg = ' :repl-env (cljs.repl.browser/repl-env :port '.port.')'
+    let arg = ' (cljs.repl.browser/repl-env :port '.port.')'
   else
-    let arg = ' :repl-env ' . a:arg
+    let arg = ' ' . a:arg
   endif
   let response = connection.eval('(cemerick.piggieback/cljs-repl'.arg.')')
 
@@ -249,6 +305,20 @@ function! s:piggieback.eval(expr, options) abort
     call remove(options, 'file_path')
   endif
   return call(s:repl.eval, [a:expr, options], self)
+endfunction
+
+function! s:repl.user_ns() abort
+  return 'user'
+endfunction
+
+function! s:repl.eval(expr, options) dict abort
+  if has_key(a:options, 'ns') && a:options.ns !=# self.user_ns()
+    let error = self.preload(a:options.ns)
+    if !empty(error)
+      return error
+    endif
+  endif
+  return s:conn_try(self.connection, 'eval', a:expr, a:options)
 endfunction
 
 function! s:register_connection(conn, ...) abort
@@ -273,10 +343,11 @@ function! fireplace#register_port_file(portfile, ...) abort
   endif
   if empty(old) && getfsize(a:portfile) > 0
     let port = matchstr(readfile(a:portfile, 'b', 1)[0], '\d\+')
-    let s:repl_portfiles[a:portfile] = {'time': getftime(a:portfile)}
     try
       let conn = fireplace#nrepl_connection#open(port)
-      let s:repl_portfiles[a:portfile].connection = conn
+      let s:repl_portfiles[a:portfile] = {
+            \ 'time': getftime(a:portfile),
+            \ 'connection': conn}
       call s:register_connection(conn, a:0 ? a:1 : '')
       return conn
     catch /^nREPL Connection Error:/
@@ -521,7 +592,7 @@ function! fireplace#platform(...) abort
 
   let portfile = findfile('.nrepl-port', '.;')
   if !empty(portfile)
-    call fireplace#register_port_file(portfile, fnamemodify(portfile, ':h'))
+    call fireplace#register_port_file(portfile, fnamemodify(portfile, ':p:h'))
   endif
   silent doautocmd User FireplacePreConnect
 
@@ -541,7 +612,7 @@ function! fireplace#platform(...) abort
     endif
   endfor
   let path = s:path_extract(getbufvar(buf, '&path'))
-  if !empty(path) && fnamemodify(bufname(buf), ':e') =~# '^cljx\=$'
+  if !empty(path) && fnamemodify(bufname(buf), ':e') =~# '^clj[cx]\=$'
     return extend({'_path': path, 'nr': bufnr(buf)}, s:oneoff)
   endif
   throw 'Fireplace: :Connect to a REPL or install classpath.vim'
@@ -754,6 +825,10 @@ function! fireplace#evalparse(expr, ...) abort
   throw err
 endfunction
 
+function! fireplace#query(expr, ...) abort
+  return fireplace#evalparse(a:expr, a:0 ? a:1 : {})
+endfunction
+
 " Section: Quickfix
 
 function! s:qfmassage(line, path) abort
@@ -804,7 +879,7 @@ augroup END
 
 " Section: Eval
 
-let fireplace#skip = 'synIDattr(synID(line("."),col("."),1),"name") =~? "comment\\|string\\|char"'
+let fireplace#skip = 'synIDattr(synID(line("."),col("."),1),"name") =~? "comment\\|string\\|char\\|regexp"'
 
 function! s:opfunc(type) abort
   let sel_save = &selection
@@ -1042,7 +1117,7 @@ xnoremap <silent> <Plug>FireplaceMacroExpand  :<C-U>call <SID>macroexpandop(visu
 nnoremap <silent> <Plug>FireplaceCountMacroExpand  :<C-U>call <SID>macroexpandop(v:count)<CR>
 nnoremap <silent> <Plug>Fireplace1MacroExpand :<C-U>set opfunc=<SID>macroexpand1op<CR>g@
 xnoremap <silent> <Plug>Fireplace1MacroExpand :<C-U>call <SID>macroexpand1op(visualmode())<CR>
-nnoremap <silent> <Plug>Fireplace1MacroExpand :<C-U>call <SID>macroexpand1op(v:count)<CR>
+nnoremap <silent> <Plug>FireplaceCount1MacroExpand :<C-U>call <SID>macroexpand1op(v:count)<CR>
 
 nnoremap <silent> <Plug>FireplaceEdit   :<C-U>set opfunc=<SID>editop<CR>g@
 xnoremap <silent> <Plug>FireplaceEdit   :<C-U>call <SID>editop(visualmode())<CR>
@@ -1148,7 +1223,7 @@ function! s:set_up_require() abort
   command! -buffer -bar -bang -complete=customlist,fireplace#ns_complete -nargs=? Require :exe s:Require(<bang>0, 1, <q-args>)
 
   if get(g:, 'fireplace_no_maps') | return | endif
-  nnoremap <silent><buffer> cpr :if expand('%:e') ==# 'cljs'<Bar>Require<Bar>else<Bar>RunTests<Bar>endif<CR>
+  nnoremap <silent><buffer> cpr :<C-R>=expand('%:e') ==# 'cljs' ? 'Require' : 'RunTests'<CR><CR>
 endfunction
 
 augroup fireplace_require
@@ -1163,6 +1238,8 @@ function! fireplace#info(symbol) abort
     let response = fireplace#message({'op': 'info', 'symbol': a:symbol})[0]
     if type(get(response, 'value')) == type({})
       return response.value
+    elseif has_key(response, 'file')
+      return response
     endif
   endif
   let cmd =
@@ -1259,48 +1336,76 @@ function! fireplace#findfile(path) abort
   return ''
 endfunction
 
-function! s:GF(cmd, file) abort
-  if a:file =~# '^\w[[:alnum:]_/]*$' &&
+function! fireplace#cfile() abort
+  let file = expand('<cfile>')
+  if file =~# '^\w[[:alnum:]_/]*$' &&
         \ synIDattr(synID(line("."),col("."),1),"name") =~# 'String'
-    let file = substitute(expand('%:p'), '[^\/:]*$', '', '').a:file.'.'.expand('%:e')
-  elseif a:file =~# '^[^/]*/[^/.]*$' && a:file =~# '^\k\+$'
-    let [file, jump] = split(a:file, "/")
+    let file = substitute(expand('%:p'), '[^\/:]*$', '', '').a:file
+  elseif file =~# '^[^/]*/[^/.]*$' && file =~# '^\k\+$'
+    let [file, jump] = split(file, "/")
     if file !~# '\.'
       try
-        let file = fireplace#evalparse('((ns-aliases *ns*) '.s:qsym(file).' '.s:qsym(file).')')
+        let file = tr(fireplace#evalparse('((ns-aliases *ns*) '.s:qsym(file).' '.s:qsym(file).')'), '.-', '/_')
       catch /^Clojure:/
       endtry
     endif
-    let file = fireplace#findfile(file)
+  elseif file =~# '^\w[[:alnum:]-]\+\.[[:alnum:].-]\+$'
+    let file = tr(file, '.-', '/_')
+  endif
+  if exists('jump')
+    return '+sil!dj\ ' . jump . ' ' . fnameescape(file)
   else
-    let file = fireplace#findfile(a:file)
+    return fnameescape(file)
   endif
-  if file ==# ''
-    let v:errmsg = "Couldn't find file for ".a:file
-    return 'echoerr v:errmsg'
-  endif
-  return a:cmd .
-        \ (exists('jump') ? ' +sil!\ djump\ ' . jump : '') .
-        \ ' ' . fnameescape(file) .
-        \ '| let &l:path = ' . string(&l:path)
 endfunction
 
-nnoremap <silent> <Plug>FireplaceEditFile    :<C-U>exe <SID>GF('edit', expand('<cfile>'))<CR>
-nnoremap <silent> <Plug>FireplaceSplitFile   :<C-U>exe <SID>GF('split', expand('<cfile>'))<CR>
-nnoremap <silent> <Plug>FireplaceTabeditFile :<C-U>exe <SID>GF('tabedit', expand('<cfile>'))<CR>
+function! s:Find(find, edit) abort
+  let cfile = fireplace#cfile()
+  let prefix = matchstr(cfile, '^\%(+\%(\\.\|\S\)*\s\+\)')
+  let file = fireplace#findfile(expand(strpart(cfile, len(prefix))))
+  if file =~# '^zipfile:'
+    let setpath = 'let\ &l:path=getbufvar('.bufnr('').",'&path')"
+    if prefix =~# '^+[^+]'
+      let prefix = substitute(prefix, '+', '\="+".setpath."\\|"', '')
+    else
+      let prefix = '+'.setpath.' '.prefix
+    endif
+  endif
+  if len(file)
+    return (len(a:edit) ? a:edit . ' ' : '') . prefix . fnameescape(file)
+  else
+    return len(a:find) ? a:find . ' ' . cfile : "\<C-R>\<C-P>"
+  endif
+endfunction
+
+nnoremap <silent> <Plug>FireplaceEditFile    :<C-U>exe <SID>Find('find','edit')<CR>
+nnoremap <silent> <Plug>FireplaceSplitFile   :<C-U>exe <SID>Find('sfind','split')<CR>
+nnoremap <silent> <Plug>FireplaceTabeditFile :<C-U>exe <SID>Find('tabfind','tabedit')<CR>
 
 function! s:set_up_go_to_file() abort
   if expand('%:e') ==# 'cljs'
-    setlocal suffixesadd=.cljs,.cljx,.clj,.java
+    setlocal suffixesadd=.cljs,.cljc,.cljx,.clj,.java
   else
-    setlocal suffixesadd=.clj,.cljx,.cljs,.java
+    setlocal suffixesadd=.clj,.cljc,.cljx,.cljs,.java
   endif
 
+  cmap <buffer><script><expr> <Plug><cfile> substitute(fireplace#cfile(),'^$',"\022\006",'')
+  cmap <buffer><script><expr> <Plug><cpath> <SID>Find('','')
   if get(g:, 'fireplace_no_maps') | return | endif
-  nmap <buffer> gf         <Plug>FireplaceEditFile
-  nmap <buffer> <C-W>f     <Plug>FireplaceSplitFile
-  nmap <buffer> <C-W><C-F> <Plug>FireplaceSplitFile
-  nmap <buffer> <C-W>gf    <Plug>FireplaceTabeditFile
+  cmap <buffer> <C-R><C-F> <Plug><cfile>
+  cmap <buffer> <C-R><C-P> <Plug><cpath>
+  if empty(mapcheck('gf', 'n'))
+    nmap <buffer> gf         <Plug>FireplaceEditFile
+  endif
+  if empty(mapcheck('<C-W>f', 'n'))
+    nmap <buffer> <C-W>f     <Plug>FireplaceSplitFile
+  endif
+  if empty(mapcheck('<C-W><C-F>', 'n'))
+    nmap <buffer> <C-W><C-F> <Plug>FireplaceSplitFile
+  endif
+  if empty(mapcheck('<C-W>gf', 'n'))
+    nmap <buffer> <C-W>gf    <Plug>FireplaceTabeditFile
+  endif
 endfunction
 
 augroup fireplace_go_to_file
@@ -1387,7 +1492,7 @@ endfunction
 
 function! s:K() abort
   let word = expand('<cword>')
-  let java_candidate = matchstr(word, '^\%(\w\+\.\)*\u\l\w*\ze\%(\.\|\/\w\+\)\=$')
+  let java_candidate = matchstr(word, '^\%(\w\+\.\)*\u\l[[:alnum:]$]*\ze\%(\.\|\/\w\+\)\=$')
   if java_candidate !=# ''
     return 'Javadoc '.java_candidate
   else
@@ -1421,13 +1526,14 @@ augroup END
 " Section: Tests
 
 function! fireplace#capture_test_run(expr, ...) abort
-  let expr = '(require ''clojure.test) '
-        \ . '(try '
-        \ . '(binding [clojure.test/report (fn [m]'
+  let expr = '(try'
+        \ . ' (require ''clojure.test)'
+        \ . ' (binding [clojure.test/report (fn [m]'
         \ .  ' (case (:type m)'
         \ .    ' (:fail :error)'
         \ .    ' (let [{file :file line :line test :name} (meta (last clojure.test/*testing-vars*))]'
         \ .      ' (clojure.test/with-test-out'
+        \ .        ' (clojure.test/inc-report-counter (:type m))'
         \ .        ' (println (clojure.string/join "\t" [file line (name (:type m)) test]))'
         \ .        ' (when (seq clojure.test/*testing-contexts*) (println (clojure.test/testing-contexts-str)))'
         \ .        ' (when-let [message (:message m)] (println message))'
@@ -1478,33 +1584,54 @@ function! fireplace#capture_test_run(expr, ...) abort
   endfor
 endfunction
 
-function! s:RunTests(bang, ...) abort
+function! s:RunTests(bang, count, ...) abort
   if &autowrite || &autowriteall
     silent! wall
   endif
-  let reqs = map(copy(a:000), '"''".v:val')
-  let pre = '(clojure.core/require '.join(empty(a:000) ? ["'".fireplace#ns()] : reqs, ' ').' :reload) '
-  let expr = join(['(clojure.test/run-tests'] + reqs, ' ').')'
-  call fireplace#capture_test_run(expr, pre)
-  echo expr
-endfunction
-
-function! s:RunAllTests(bang, ...) abort
-  if a:0
-    let expr = '(clojure.test/run-all-tests #"'.join(a:000, '|').'")'
+  if a:count < 0
+    let pre = ''
+    if a:0
+      let expr = '(clojure.test/run-all-tests #"'.join(a:000, '|').'")'
+    else
+      let expr = '(clojure.test/run-all-tests)'
+    endif
   else
-    let expr = '(clojure.test/run-all-tests)'
+    if a:0 && a:000 !=# [fireplace#ns()]
+      let args = a:000
+    else
+      let args = [fireplace#ns()]
+      if a:count
+        let pattern = '^\s*(def\k*\s\+\(\h\k*\)'
+        let line = search(pattern, 'bcWn')
+        if line
+          let args[0] .= '/' . matchlist(getline(line), pattern)[1]
+        endif
+      endif
+    endif
+    let reqs = map(copy(args), '"''".v:val')
+    let pre = '(clojure.core/require '.substitute(join(reqs, ' '), '/\k\+', '', 'g').' :reload) '
+    let expr = []
+    let vars = filter(copy(reqs), 'v:val =~# "/"')
+    let nses = filter(copy(reqs), 'v:val !~# "/"')
+    if len(vars) == 1
+      call add(expr, '(clojure.test/test-var #' . vars[0] . ')')
+    elseif !empty(vars)
+      call add(expr, join(['(clojure.test/test-vars'] + map(vars, '"#".v:val'), ' ').')')
+    endif
+    if !empty(nses)
+      call add(expr, join(['(clojure.test/run-tests'] + nses, ' ').')')
+    endif
   endif
-  call fireplace#capture_test_run(expr)
-  echo expr
+  call fireplace#capture_test_run(join(expr, ' '), pre)
+  echo join(expr, ' ')
 endfunction
 
 function! s:set_up_tests() abort
-  command! -buffer -bar -bang -nargs=*
+  command! -buffer -bar -bang -range=0 -nargs=*
         \ -complete=customlist,fireplace#ns_complete RunTests
-        \ call s:RunTests(<bang>0, <f-args>)
+        \ call s:RunTests(<bang>0, <line1> == 0 ? -1 : <count>, <f-args>)
   command! -buffer -bang -nargs=* RunAllTests
-        \ call s:RunAllTests(<bang>0, <f-args>)
+        \ call s:RunTests(<bang>0, -1, <f-args>)
 endfunction
 
 augroup fireplace_tests
